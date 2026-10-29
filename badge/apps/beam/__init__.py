@@ -250,51 +250,64 @@ def scan_sideloaded():
 class SenderEngine:
     def __init__(self, app_info):
         self.app_info = app_info
-        self.files_data = []
-        for rel_path, full_path, size in app_info["files"]:
-            try:
-                with open(full_path, "rb") as f:
-                    content = f.read()
-            except OSError:
-                content = b""
-            self.files_data.append((rel_path, content))
-
         manifest = {
             "slug": app_info["slug"],
             "name": app_info["name"],
             "total_size": app_info["size"],
-            "files": [{"path": r, "size": len(c)} for r, c in self.files_data],
+            "files": [{"path": r, "size": s} for r, f, s in app_info["files"]],
         }
         self.manifest_raw = json.dumps(manifest).encode()
-        self.manifest_chunks = [
-            self.manifest_raw[i:i + CHUNK_PAYLOAD_SIZE]
-            for i in range(0, len(self.manifest_raw), CHUNK_PAYLOAD_SIZE)
-        ]
+        self.manifest_chunks = None
         self.manifest_sent = 0
 
-        # File chunking
-        self.all_file_chunks = []
-        for file_idx, (rel_path, content) in enumerate(self.files_data):
-            chunks = [
-                content[i:i + CHUNK_PAYLOAD_SIZE]
-                for i in range(0, len(content), CHUNK_PAYLOAD_SIZE)
-            ]
-            if not chunks:
-                chunks = [b""]  # Empty file
-            for chunk_idx, payload in enumerate(chunks):
-                self.all_file_chunks.append((file_idx, chunk_idx, len(chunks), payload))
+        self.file_idx = 0
+        self.current_file_chunks = None
+        self.current_chunk_idx = 0
+        self.confirmed_files = set()
 
-        self.data_sent = 0
         self.accepted = False
         self.rejected_reason = None
         self.finished = False
+        self.last_query_at = 0
 
-    def pump(self, link):
+    def init_manifest_chunks(self, cap):
+        payload_size = max(1, cap - 5)
+        self.manifest_chunks = [
+            self.manifest_raw[i:i + payload_size]
+            for i in range(0, len(self.manifest_raw), payload_size)
+        ]
+
+    def load_file(self, file_idx, cap):
+        if file_idx >= len(self.app_info["files"]):
+            return False
+        rel_path, full_path, size = self.app_info["files"][file_idx]
+        try:
+            with open(full_path, "rb") as f:
+                content = f.read()
+        except OSError:
+            content = b""
+        payload_size = max(1, cap - 7)
+        chunks = [
+            content[i:i + payload_size]
+            for i in range(0, len(content), payload_size)
+        ]
+        if not chunks:
+            chunks = [b""]
+        self.current_file_chunks = chunks
+        self.current_chunk_idx = 0
+        return True
+
+    def pump(self, link, now=0):
         if link is None or not link.linked:
             return
 
+        cap = link.capacity() if hasattr(link, "capacity") else 20
+
         # 1. Send Manifest
         if not self.accepted and self.rejected_reason is None:
+            if self.manifest_chunks is None:
+                self.init_manifest_chunks(cap)
+
             while self.manifest_sent < len(self.manifest_chunks):
                 chunk = (
                     b"M"
@@ -304,20 +317,41 @@ class SenderEngine:
                 if not link.send(chunk):
                     return
                 self.manifest_sent += 1
+
+            if self.manifest_sent >= len(self.manifest_chunks):
+                if now - self.last_query_at >= 300:
+                    self.last_query_at = now
+                    link.send(b"QM")
             return
 
-        # 2. Send File Data Chunks
+        # 2. Send Files
         if self.accepted and not self.finished:
-            while self.data_sent < len(self.all_file_chunks):
-                f_idx, c_idx, total_c, payload = self.all_file_chunks[self.data_sent]
-                frame = b"D" + struct.pack(">HHH", f_idx, c_idx, total_c) + payload
+            total_files = len(self.app_info["files"])
+            if self.file_idx >= total_files:
+                if now - self.last_query_at >= 300:
+                    self.last_query_at = now
+                    link.send(b"FDONE")
+                return
+
+            if self.current_file_chunks is None:
+                if not self.load_file(self.file_idx, cap):
+                    return
+
+            while self.current_chunk_idx < len(self.current_file_chunks):
+                payload = self.current_file_chunks[self.current_chunk_idx]
+                frame = (
+                    b"D"
+                    + struct.pack(">HHH", self.file_idx, self.current_chunk_idx, len(self.current_file_chunks))
+                    + payload
+                )
                 if not link.send(frame):
                     return
-                self.data_sent += 1
+                self.current_chunk_idx += 1
 
-            # 3. Finish Signal
-            if self.data_sent >= len(self.all_file_chunks):
-                link.send(b"FDONE")
+            if self.current_chunk_idx >= len(self.current_file_chunks):
+                if now - self.last_query_at >= 300:
+                    self.last_query_at = now
+                    link.send(b"QF" + struct.pack(">H", self.file_idx))
 
     def handle(self, message):
         tag = message[:1]
@@ -327,14 +361,32 @@ class SenderEngine:
                 self.accepted = True
             else:
                 self.rejected_reason = message[2:].decode() or "Peer rejected"
+        elif tag == b"R":
+            if len(message) >= 5:
+                f_idx, chunk_or_status = struct.unpack_from(">HH", message, 1)
+                if f_idx == 0xFFFF:  # Manifest query response
+                    if chunk_or_status != 0xFFFF and self.manifest_chunks and chunk_or_status < len(self.manifest_chunks):
+                        self.manifest_sent = chunk_or_status
+                elif f_idx == self.file_idx:
+                    if chunk_or_status == 0xFFFF:
+                        self.confirmed_files.add(f_idx)
+                        self.file_idx += 1
+                        self.current_file_chunks = None
+                    else:
+                        self.current_chunk_idx = chunk_or_status
         elif tag == b"K":
             if message[1:] == b"DONE":
                 self.finished = True
 
     @property
     def progress(self):
-        total = len(self.all_file_chunks)
-        return (self.data_sent / total) if total > 0 else 1.0
+        total_files = len(self.app_info["files"])
+        if total_files == 0:
+            return 1.0
+        cur = 0.0
+        if self.current_file_chunks and len(self.current_file_chunks) > 0:
+            cur = self.current_chunk_idx / len(self.current_file_chunks)
+        return min(1.0, (self.file_idx + cur) / total_files)
 
 
 class ReceiverEngine:
@@ -342,8 +394,9 @@ class ReceiverEngine:
         self.manifest_parts = {}
         self.manifest_total = None
         self.manifest = None
-        self.file_chunks = {}  # file_idx -> {chunk_idx: payload}
-        self.file_totals = {}  # file_idx -> total_chunks
+        self.file_chunks = {}
+        self.file_totals = {}
+        self.saved_files = set()
         self.installed = False
         self.error_msg = None
         self.accepted = False
@@ -356,32 +409,50 @@ class ReceiverEngine:
             part_idx, total_parts = struct.unpack_from(">HH", message, 1)
             self.manifest_total = total_parts
             self.manifest_parts[part_idx] = message[5:]
+            self._check_manifest(link)
 
-            if len(self.manifest_parts) == self.manifest_total:
-                try:
-                    raw = b"".join(self.manifest_parts[i] for i in range(self.manifest_total))
-                    self.manifest = json.loads(raw)
-                except Exception as e:
-                    self.error_msg = "Manifest parse error"
+        elif tag == b"Q":
+            sub = message[1:2]
+            if sub == b"M":
+                if self.manifest is None:
+                    if self.manifest_total:
+                        for i in range(self.manifest_total):
+                            if i not in self.manifest_parts:
+                                if link:
+                                    link.send(b"R" + struct.pack(">HH", 0xFFFF, i))
+                                return
+                else:
                     if link:
-                        link.send(b"A0" + b"Corrupt manifest")
-                    return
-
-                # Validate space
-                needed = self.manifest.get("total_size", 0) + 8192
-                free = free_storage_bytes()
-                if free < needed:
-                    self.error_msg = f"Need {format_size(needed)}, free: {format_size(free)}"
-                    if link:
-                        link.send(b"A0" + self.error_msg.encode())
-                    return
-
-                self.accepted = True
-                if link:
-                    link.send(b"A1")
+                        link.send(b"A1" if self.accepted else (b"A0" + (self.error_msg or "").encode()))
+            elif sub == b"F":
+                if len(message) >= 4:
+                    f_idx = struct.unpack_from(">H", message, 2)[0]
+                    if f_idx in self.saved_files:
+                        if link:
+                            link.send(b"R" + struct.pack(">HH", f_idx, 0xFFFF))
+                        return
+                    chunks = self.file_chunks.get(f_idx, {})
+                    total = self.file_totals.get(f_idx, None)
+                    if total is not None:
+                        for c in range(total):
+                            if c not in chunks:
+                                if link:
+                                    link.send(b"R" + struct.pack(">HH", f_idx, c))
+                                return
+                        # All chunks present: write file to flash immediately to free RAM
+                        if self._save_single_file(f_idx):
+                            self.saved_files.add(f_idx)
+                            if f_idx in self.file_chunks:
+                                del self.file_chunks[f_idx]
+                            if link:
+                                link.send(b"R" + struct.pack(">HH", f_idx, 0xFFFF))
+                        else:
+                            self.error_msg = "Flash write error"
+                            if link:
+                                link.send(b"A0" + self.error_msg.encode())
 
         elif tag == b"D":
-            if len(message) < 7 or self.manifest is None:
+            if len(message) < 7:
                 return
             file_idx, chunk_idx, total_chunks = struct.unpack_from(">HHH", message, 1)
             payload = message[7:]
@@ -394,50 +465,78 @@ class ReceiverEngine:
 
         elif tag == b"F":
             if message[1:] == b"DONE" and self.manifest is not None and not self.installed:
-                success = self.install_files()
-                if success:
+                total_files = len(self.manifest.get("files", []))
+                if len(self.saved_files) >= total_files:
                     self.installed = True
                     if link:
                         link.send(b"KDONE")
                 else:
-                    self.error_msg = "Installation write failed"
+                    self.error_msg = "Incomplete transfer"
+                    if link:
+                        link.send(b"A0" + self.error_msg.encode())
 
-    def install_files(self):
+    def _check_manifest(self, link):
+        if self.manifest_total and len(self.manifest_parts) == self.manifest_total and self.manifest is None:
+            try:
+                raw = b"".join(self.manifest_parts[i] for i in range(self.manifest_total))
+                self.manifest = json.loads(raw)
+            except Exception:
+                self.error_msg = "Manifest parse error"
+                if link:
+                    link.send(b"A0" + b"Corrupt manifest")
+                return
+
+            files_meta = self.manifest.get("files", [])
+            total_meta_size = sum(((m.get("size", 0) + 4095) // 4096) * 4096 for m in files_meta)
+            needed = max(self.manifest.get("total_size", 0), total_meta_size) + 8192
+            free = free_storage_bytes()
+            if free < needed:
+                self.error_msg = f"Need {format_size(needed)}, free: {format_size(free)}"
+                if link:
+                    link.send(b"A0" + self.error_msg.encode())
+                return
+
+            self.accepted = True
+            if link:
+                link.send(b"A1")
+
+    def _save_single_file(self, file_idx):
+        if not self.manifest:
+            return False
+        files_meta = self.manifest.get("files", [])
+        if file_idx >= len(files_meta):
+            return False
+        meta = files_meta[file_idx]
         slug = self.manifest["slug"]
         base_dir = f"/apps/{slug}"
         ensure_directory(base_dir)
 
-        files_meta = self.manifest.get("files", [])
-        for file_idx, meta in enumerate(files_meta):
-            rel_path = meta["path"]
-            chunks_dict = self.file_chunks.get(file_idx, {})
-            expected_chunks = self.file_totals.get(file_idx, 0)
+        rel_path = meta["path"]
+        chunks_dict = self.file_chunks.get(file_idx, {})
+        expected_chunks = self.file_totals.get(file_idx, 0)
 
-            # Reconstruct content
-            content = b"".join(chunks_dict.get(c, b"") for c in range(expected_chunks))
+        content = b"".join(chunks_dict.get(c, b"") for c in range(expected_chunks))
 
-            target_path = f"{base_dir}/{rel_path}"
-            # Ensure subdirectories
-            parent_dir = target_path.rsplit("/", 1)[0]
-            ensure_directory(parent_dir)
+        target_path = f"{base_dir}/{rel_path}"
+        parent_dir = target_path.rsplit("/", 1)[0]
+        ensure_directory(parent_dir)
 
-            # If writing __init__.py, ensure it can run from /apps
-            if rel_path == "__init__.py":
-                try:
-                    text = content.decode("utf-8")
-                    if f"/system/apps/{slug}" in text:
-                        text = text.replace(f"/system/apps/{slug}", f"/apps/{slug}")
-                        content = text.encode("utf-8")
-                except Exception:
-                    pass
-
+        if rel_path == "__init__.py":
             try:
-                with open(target_path, "wb") as f:
-                    f.write(content)
-            except OSError as e:
-                print(f"Error writing {target_path}:", e)
-                return False
-        return True
+                text = content.decode("utf-8")
+                if f"/system/apps/{slug}" in text:
+                    text = text.replace(f"/system/apps/{slug}", f"/apps/{slug}")
+                    content = text.encode("utf-8")
+            except (UnicodeError, ValueError):
+                pass
+
+        try:
+            with open(target_path, "wb") as f:
+                f.write(content)
+            return True
+        except OSError as e:
+            print(f"Error writing {target_path}:", e)
+            return False
 
     @property
     def progress(self):
@@ -446,9 +545,7 @@ class ReceiverEngine:
         files_meta = self.manifest.get("files", [])
         if not files_meta:
             return 1.0
-        total_chunks = sum(self.file_totals.get(idx, 1) for idx in range(len(files_meta)))
-        received_chunks = sum(len(self.file_chunks.get(idx, {})) for idx in range(len(files_meta)))
-        return min(1.0, received_chunks / max(1, total_chunks))
+        return min(1.0, len(self.saved_files) / len(files_meta))
 
 
 class BeamApp:
@@ -504,32 +601,55 @@ class BeamApp:
             if partner:
                 self.partner_name = partner.name
                 self.partner_id = partner.id
+            if self.sender is not None:
+                self.set_state(self.STATE_TRANSFER)
+            if self.proximity:
+                self.proximity.clear()
+            try:
+                badge.caselights(0.5)
+            except Exception:
+                pass
 
-        if self.was_linked and not linked and self.state == self.STATE_TRANSFER:
-            if self.receiver and self.receiver.installed:
-                self.set_state(self.STATE_SUCCESS)
-            elif self.sender and self.sender.finished:
-                self.set_state(self.STATE_SUCCESS)
-            else:
-                self.status_msg = "Link disconnected"
-                self.set_state(self.STATE_ERROR)
+        if self.was_linked and not linked:
+            if self.state == self.STATE_TRANSFER:
+                if self.receiver and self.receiver.installed:
+                    self.set_state(self.STATE_SUCCESS)
+                elif self.sender and self.sender.finished:
+                    self.set_state(self.STATE_SUCCESS)
+                else:
+                    self.status_msg = "Link disconnected"
+                    self.set_state(self.STATE_ERROR)
+            if self.proximity:
+                partner = self.link.partner
+                self.proximity.rest(partner.id if partner else None, now)
+                self.proximity.clear()
+            try:
+                badge.caselights(0)
+            except Exception:
+                pass
 
         self.was_linked = linked
 
+        # Run proximity engine every frame while not linked
+        if not linked and self.proximity:
+            self.proximity.update(now)
+            lights = self.proximity.lights(now)
+            try:
+                badge.caselights(*(lights or (0,)))
+            except Exception:
+                pass
+
         # Pump active transmissions
         if self.sender and linked:
-            self.sender.pump(self.link)
+            self.sender.pump(self.link, now)
 
         # Receive incoming packets
         if linked:
             for message in self.link.receive():
-                if self.state == self.STATE_BROWSE or self.state == self.STATE_OFFER:
-                    # Incoming beam offer
-                    if message.startswith(b"M"):
+                if self.state in (self.STATE_BROWSE, self.STATE_OFFER) and message.startswith(b"M"):
+                    if self.receiver is None:
                         self.receiver = ReceiverEngine()
-                        self.set_state(self.STATE_TRANSFER)
-                        self.receiver.handle(message, self.link)
-                        continue
+                    self.set_state(self.STATE_TRANSFER)
 
                 if self.sender:
                     self.sender.handle(message)
@@ -549,6 +669,24 @@ class BeamApp:
                         self.set_state(self.STATE_SUCCESS)
 
         self.link.update()
+
+    def leave(self, now, message=""):
+        if self.link:
+            partner = self.link.partner
+            if self.proximity:
+                self.proximity.rest(partner.id if partner else None, now)
+                self.proximity.clear()
+            self.link.leave()
+        try:
+            badge.caselights(0)
+        except Exception:
+            pass
+        self.sender = None
+        self.receiver = None
+        self.was_linked = False
+        if message:
+            self.status_msg = message
+        self.set_state(self.STATE_BROWSE)
 
     def handle_inputs(self, now):
         if self.state == self.STATE_BROWSE:
@@ -575,23 +713,20 @@ class BeamApp:
                 elif self.tab == self.TAB_INSTALLED and self.installed_apps:
                     app = self.installed_apps[self.cursor_installed]
                     self.launch_path = app["path"]
+            elif badge.pressed(BUTTON_BACK):
+                try:
+                    badge.caselights(0)
+                except Exception:
+                    pass
+                reset()
 
         elif self.state == self.STATE_OFFER:
             if badge.pressed(BUTTON_BACK) or badge.pressed(BUTTON_LEFT):
-                if self.link:
-                    self.link.leave()
-                self.sender = None
-                self.set_state(self.STATE_BROWSE)
-            elif self.link and self.link.linked:
-                self.set_state(self.STATE_TRANSFER)
+                self.leave(now)
 
         elif self.state == self.STATE_TRANSFER:
             if badge.pressed(BUTTON_BACK):
-                if self.link:
-                    self.link.leave()
-                self.sender = None
-                self.receiver = None
-                self.set_state(self.STATE_BROWSE)
+                self.leave(now, "Transfer canceled")
 
         elif self.state == self.STATE_SUCCESS:
             elapsed = (now - self.state_at) // 1000
@@ -600,15 +735,11 @@ class BeamApp:
                 if badge.pressed(BUTTON_SELECT) or elapsed >= self.AUTO_LAUNCH_SECONDS:
                     self.launch_path = f"/apps/{slug}"
             if badge.pressed(BUTTON_BACK):
-                self.sender = None
-                self.receiver = None
-                self.set_state(self.STATE_BROWSE)
+                self.leave(now)
 
         elif self.state == self.STATE_ERROR:
             if badge.pressed(BUTTON_SELECT) or badge.pressed(BUTTON_BACK):
-                self.sender = None
-                self.receiver = None
-                self.set_state(self.STATE_BROWSE)
+                self.leave(now)
 
     def draw_header(self, title, tab_active=None):
         screen.pen = black
@@ -655,7 +786,7 @@ class BeamApp:
         screen.pen = t2_color
         screen.text("< 2. Installed Apps >", 175, 32)
 
-    def draw_app_list(self, apps_list, cursor):
+    def draw_app_list(self, apps_list, cursor, now):
         if not apps_list:
             screen.pen = faint_white
             screen.text("No applications found.", 24, 80)
@@ -697,6 +828,21 @@ class BeamApp:
             screen.text(info, WIDTH - w - 16, row_y + 8)
 
             row_y += row_height
+
+        # Bottom hint / Syncing popup
+        if not self.sender and self.proximity:
+            peer = self.proximity.syncing()
+            if peer:
+                prog = self.proximity.progress(now)
+                screen.pen = card_bg
+                screen.rectangle(12, HEIGHT - 52, WIDTH - 24, 26)
+                screen.pen = emerald
+                screen.rectangle(12, HEIGHT - 52, WIDTH - 24, 1)
+                screen.text(f"Syncing with {peer.name}...", 20, HEIGHT - 44)
+                screen.pen = faint_white
+                screen.rectangle(WIDTH - 90, HEIGHT - 44, 70, 8)
+                screen.pen = emerald
+                screen.rectangle(WIDTH - 90, HEIGHT - 44, int(70 * prog), 8)
 
         # Footer hints
         screen.pen = card_bg
@@ -868,7 +1014,7 @@ class BeamApp:
             self.draw_tabs()
             apps = self.shareable_apps if self.tab == self.TAB_SHARE else self.installed_apps
             cursor = self.cursor_share if self.tab == self.TAB_SHARE else self.cursor_installed
-            self.draw_app_list(apps, cursor)
+            self.draw_app_list(apps, cursor, now)
         elif self.state == self.STATE_OFFER:
             self.draw_offer(now)
         elif self.state == self.STATE_TRANSFER:
